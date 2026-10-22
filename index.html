@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MIDI → カトカトーン(.ktk) 変換</title>
+</head>
+<body>
+
+<!-- ===== ここから埋め込み用ブロック(このまま他のHTMLに貼り付け可) ===== -->
+<div id="ktk-conv">
+<style>
+#ktk-conv{--ink:#1d2a2f;--mute:#5d6e74;--line:#c9d6d9;--bg:#f3f8f8;--accent:#0f7c86;font:15px/1.6 "Hiragino Sans","Yu Gothic",Meiryo,sans-serif;color:var(--ink);max-width:560px;margin:0 auto;padding:16px;box-sizing:border-box}
+#ktk-conv *{box-sizing:border-box}
+#ktk-conv h2{font-size:20px;margin:0 0 4px}
+#ktk-conv p.sub{margin:0 0 14px;color:var(--mute);font-size:13px}
+#ktk-conv .drop{display:block;border:2px dashed var(--line);border-radius:10px;background:var(--bg);padding:28px 12px;text-align:center;cursor:pointer}
+#ktk-conv .drop.over,#ktk-conv .drop:focus-within{border-color:var(--accent)}
+#ktk-conv .drop input{position:absolute;opacity:0;width:1px;height:1px}
+#ktk-conv .opts{margin:14px 0;display:grid;gap:6px;font-size:14px}
+#ktk-conv .opts label{display:flex;gap:8px;align-items:center}
+#ktk-conv .opts .tpl{color:var(--mute);font-size:13px}
+#ktk-conv ul{list-style:none;margin:0;padding:0;display:grid;gap:8px}
+#ktk-conv li{border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-size:13px;word-break:break-all}
+#ktk-conv li.err{border-color:#b3261e;color:#b3261e}
+#ktk-conv li b{display:block;font-size:14px}
+#ktk-conv li .warn{color:#8a5a00}
+#ktk-conv li a{color:var(--accent);font-weight:bold}
+</style>
+<h2>MIDI → カトカトーン変換</h2>
+<p class="sub">ファイルはブラウザ内だけで処理され、外部には送信されません。</p>
+<label class="drop" id="ktk-drop">
+  <input type="file" id="ktk-file" accept=".mid,.midi" multiple>
+  .mid / .midi をここにドロップ、またはクリックして選択(複数可)
+</label>
+<div class="opts">
+  <label><input type="checkbox" id="ktk-prog"> 楽器(プログラム番号)も反映する</label>
+  <label><input type="checkbox" id="ktk-drum"> ドラム(チャンネル10)も取り込む</label>
+  <label class="tpl">設定を引き継ぐ .ktk(任意): <input type="file" id="ktk-tpl" accept=".ktk"></label>
+</div>
+<ul id="ktk-log"></ul>
+<script>
+(function(){
+'use strict';
+const TICKS_PER_WHOLE=768, MAX_TRACKS=8, DEFAULT_MEASURES=200;
+const enc=new TextEncoder(), dec=new TextDecoder();
+
+/* ---------- ZIP (deflate-raw は CompressionStream を使用。無ければ無圧縮) ---------- */
+const CRC=(()=>{const t=new Uint32Array(256);for(let n=0;n<256;n++){let c=n;for(let k=0;k<8;k++)c=c&1?0xEDB88320^(c>>>1):c>>>1;t[n]=c>>>0}return t})();
+function crc32(b){let c=0xFFFFFFFF;for(let i=0;i<b.length;i++)c=CRC[(c^b[i])&255]^(c>>>8);return(c^0xFFFFFFFF)>>>0}
+async function pipe(bytes,Stream,fmt){
+  const s=new Blob([bytes]).stream().pipeThrough(new Stream(fmt));
+  return new Uint8Array(await new Response(s).arrayBuffer());
+}
+async function makeZip(name,data){
+  const nm=enc.encode(name), crc=crc32(data);
+  let comp=data, method=0;
+  if(typeof CompressionStream!=='undefined'){
+    try{comp=await pipe(data,CompressionStream,'deflate-raw');method=8}catch(e){comp=data;method=0}
+  }
+  const lh=30+nm.length, cd=46+nm.length;
+  const out=new Uint8Array(lh+comp.length+cd+22), v=new DataView(out.buffer);
+  let p=0;
+  v.setUint32(p,0x04034b50,true);v.setUint16(p+4,20,true);v.setUint16(p+6,0x0800,true);v.setUint16(p+8,method,true);
+  v.setUint16(p+10,0,true);v.setUint16(p+12,0x21,true);v.setUint32(p+14,crc,true);
+  v.setUint32(p+18,comp.length,true);v.setUint32(p+22,data.length,true);v.setUint16(p+26,nm.length,true);v.setUint16(p+28,0,true);
+  out.set(nm,p+30);out.set(comp,lh);
+  p=lh+comp.length;const cdStart=p;
+  v.setUint32(p,0x02014b50,true);v.setUint16(p+4,20,true);v.setUint16(p+6,20,true);v.setUint16(p+8,0x0800,true);v.setUint16(p+10,method,true);
+  v.setUint16(p+12,0,true);v.setUint16(p+14,0x21,true);v.setUint32(p+16,crc,true);
+  v.setUint32(p+20,comp.length,true);v.setUint32(p+24,data.length,true);v.setUint16(p+28,nm.length,true);
+  v.setUint32(p+42,0,true);out.set(nm,p+46);
+  p+=cd;
+  v.setUint32(p,0x06054b50,true);v.setUint16(p+8,1,true);v.setUint16(p+10,1,true);
+  v.setUint32(p+12,cd,true);v.setUint32(p+16,cdStart,true);
+  return out;
+}
+async function readZipEntry(buf,name){
+  const v=new DataView(buf.buffer,buf.byteOffset,buf.byteLength);
+  let e=buf.length-22;while(e>=0&&v.getUint32(e,true)!==0x06054b50)e--;
+  if(e<0)throw new Error('ZIPとして読めません');
+  const n=v.getUint16(e+10,true);let p=v.getUint32(e+16,true);
+  for(let i=0;i<n;i++){
+    const method=v.getUint16(p+10,true),csize=v.getUint32(p+20,true),nl=v.getUint16(p+28,true),
+          el=v.getUint16(p+30,true),cl=v.getUint16(p+32,true),off=v.getUint32(p+42,true);
+    const nm=dec.decode(buf.subarray(p+46,p+46+nl));
+    if(nm===name){
+      const ds=off+30+v.getUint16(off+26,true)+v.getUint16(off+28,true);
+      const raw=buf.subarray(ds,ds+csize);
+      return method===0?raw:await pipe(raw,DecompressionStream,'deflate-raw');
+    }
+    p+=46+nl+el+cl;
+  }
+  throw new Error('zipInside が見つかりません');
+}
+const MAGIC=enc.encode('ktk ');
+async function readKtk(bytes){
+  if(dec.decode(bytes.subarray(0,4))!=='ktk ')throw new Error('ktk ファイルではありません');
+  return JSON.parse(dec.decode(await readZipEntry(bytes.subarray(4),'zipInside')));
+}
+async function writeKtk(song){
+  const zip=await makeZip('zipInside',enc.encode(JSON.stringify(song)));
+  const out=new Uint8Array(4+zip.length);out.set(MAGIC);out.set(zip,4);return out;
+}
+
+/* ---------- MIDI 解析 ---------- */
+function vlq(d,i){let v=0;for(;;){const c=d[i++];v=(v*128)+(c&0x7F);if(!(c&0x80))return[v,i]}}
+function readSmf(d){
+  if(dec.decode(d.subarray(0,4))!=='MThd')throw new Error('MIDIファイルではありません');
+  const u32=i=>((d[i]<<24)|(d[i+1]<<16)|(d[i+2]<<8)|d[i+3])>>>0, u16=i=>(d[i]<<8)|d[i+1];
+  const ntrk=u16(10), ppq=u16(12);
+  if(ppq&0x8000)throw new Error('SMPTE形式の時間分解能には未対応です');
+  let i=8+u32(4);const tracks=[];
+  for(let k=0;k<ntrk;k++){
+    if(dec.decode(d.subarray(i,i+4))!=='MTrk')break;
+    const end=i+8+u32(i+4);let j=i+8,t=0,run=0;const ev=[];
+    while(j<end){
+      let dt;[dt,j]=vlq(d,j);t+=dt;
+      const st=d[j];
+      if(st===0xFF){const typ=d[j+1];let l;[l,j]=vlq(d,j+2);ev.push({t,meta:true,typ,data:d.subarray(j,j+l)});j+=l;continue}
+      if(st===0xF0||st===0xF7){let l;[l,j]=vlq(d,j+1);j+=l;continue}
+      if(st&0x80){run=st;j++}
+      const hi=run&0xF0,ch=run&0x0F,n=(hi===0xC0||hi===0xD0)?1:2;
+      ev.push({t,meta:false,hi,ch,a:d[j],b:n===2?d[j+1]:0});j+=n;
+    }
+    tracks.push(ev);i=end;
+  }
+  return[ppq,tracks];
+}
+function parseMidi(d,includeDrums){
+  const[ppq,tracks]=readSmf(d);
+  let bpm=120,ts=[4,4],gotT=false,gotS=false;
+  const chans=new Map(),prog=new Map();
+  tracks.forEach((ev,ti)=>{
+    const on=new Map();
+    for(const e of ev){
+      if(e.meta){
+        if(e.typ===0x51&&!gotT&&e.data.length===3){bpm=Math.round(60000000/((e.data[0]<<16)|(e.data[1]<<8)|e.data[2]));gotT=true}
+        else if(e.typ===0x58&&!gotS&&e.data.length>=2){ts=[e.data[0],2**e.data[1]];gotS=true}
+        continue;
+      }
+      const key=ti+','+e.ch;
+      if(e.hi===0xC0){if(!prog.has(key))prog.set(key,e.a)}
+      else if(e.hi===0x90&&e.b>0){const k=e.ch+','+e.a;if(!on.has(k))on.set(k,[]);on.get(k).push(e.t)}
+      else if(e.hi===0x80||e.hi===0x90){
+        const k=e.ch+','+e.a,q=on.get(k);
+        if(q&&q.length){
+          const s=q.shift();
+          if(e.ch===9&&!includeDrums)continue;
+          if(!chans.has(key))chans.set(key,{ti,ch:e.ch,notes:[]});
+          chans.get(key).notes.push([s,e.t-s,e.a]);
+        }
+      }
+    }
+  });
+  const k=192/ppq,out=[];
+  for(const[key,c]of chans){
+    out.push({key,ti:c.ti,ch:c.ch,notes:c.notes.map(([s,l,p])=>[Math.round(s*k),Math.max(1,Math.round(l*k)),p]).sort((x,y)=>x[0]-y[0]||x[1]-y[1]||x[2]-y[2])});
+  }
+  out.sort((a,b)=>a.ti-b.ti||a.ch-b.ch);
+  return{bpm,ts,chans:out,prog};
+}
+
+/* ---------- 初期テンプレート ---------- */
+function defaultTemplate(){
+  const t8=n=>Array.from({length:8},n);
+  return{BPM:120,swing:0,swingSubdivision:8,timeSignature:[4,4],keyNumber:0,numberOfDisplayedTracks:8,songName:'タイトル',
+  trackUIOrderMap:[0,1,2,3,4,5,6,7],masterGainValue:1,EQLow:0.5,EQMid:0.5,EQHigh:0.5,
+  instrumentTracks:t8(()=>({gadgetType:1,programNumber:0,gainValue:0.7952755905511811,instrumentTrackOnOff:true,programName:'ピアノ'})),
+  ruleTrackData:Array.from({length:DEFAULT_MEASURES},()=>({})),
+  activeRange:[1,4],activeDetailRange:[1,1],loopRange:[1,1],activeTrackNumber:0,
+  pianoRollScrollPositions:[0.4805,0,0,0,0,0,0,0],sharpOrFlat:'sharp',otamachopIndexArr:t8(()=>0),magnifyIndexArr:t8(()=>2),
+  canvasNumberOfReallyDisplayedTracks:8,canvasScrollPosition:0,pianorollKeyboardFilter:Array(12).fill(true),
+  oneTrackView:false,songChartShownPosition:0,stretchOrMove:'stretch',showRuleTrack:false,metronomeOn:false,
+  metronomeVolume:0.5,metronomeSoundId:0,loopOn:false,enableNumberOfTracks:true,enableTrackEdit:Array(8).fill(true),
+  enableRuleTrackEdit:true,enableMute:true,enableRule:{key:true,bpm:true,timeSignature:true,swing:true},
+  otamachopDisplay:{whole:true,half:true,quarter:true,eighth:true,sixteenth:true,thirtysecond:true,eighthTriplet:true,sixteenthTriplet:true},
+  displayInsertButton:true,displayStretchOrMoveButton:false,displayKeyboardFilterButton:true,displayFlatSharpButton:true,
+  displayComputerKeyButton:true,displayMidiButton:false,version:'1.0'};
+}
+
+/* ---------- 変換本体 ---------- */
+// midiBytes: Uint8Array / opts: {templateKtk:Uint8Array, setProgram:bool, includeDrums:bool}
+// 戻り値: {data:Uint8Array(.ktk), info:{...}, warnings:[...]}
+async function convert(midiBytes,opts){
+  opts=opts||{};const warnings=[];
+  let song,orig;
+  if(opts.templateKtk){song=await readKtk(opts.templateKtk);orig=(song.seqData&&song.seqData[0])?song.seqData[0].length:DEFAULT_MEASURES}
+  else{song=defaultTemplate();orig=DEFAULT_MEASURES}
+  const{bpm,ts,chans,prog}=parseMidi(midiBytes,!!opts.includeDrums);
+  const[num,den]=ts,measureLen=TICKS_PER_WHOLE*num/den;
+  let parts=chans;
+  if(parts.length>MAX_TRACKS){warnings.push(`音のあるパートが ${parts.length} 個あるため、先頭 ${MAX_TRACKS} 個だけ使います`);parts=parts.slice(0,MAX_TRACKS)}
+  let end=0;for(const p of parts)for(const[s,l]of p.notes)end=Math.max(end,s+l);
+  const used=Math.max(1,Math.ceil(end/measureLen)),nMeas=Math.max(orig,used);
+  if(used>DEFAULT_MEASURES)warnings.push(`${used} 小節あります。カトカトーンが対応する小節数(${DEFAULT_MEASURES})を超える可能性があります`);
+  const seq=Array.from({length:MAX_TRACKS},()=>Array.from({length:nMeas},()=>({noteData:[]})));
+  let count=0;
+  parts.forEach((p,ti)=>{
+    for(let[s,l,pitch]of p.notes){
+      while(l>0){
+        const m=Math.floor(s/measureLen),off=s-m*measureLen,seg=Math.min(l,measureLen-off);
+        seq[ti][m].noteData.push({timing:off,length:seg,pitch});count++;
+        s+=seg;l-=seg;
+      }
+    }
+    if(opts.setProgram&&prog.has(p.key)){song.instrumentTracks[ti].programNumber=prog.get(p.key);delete song.instrumentTracks[ti].programName}
+  });
+  Object.assign(song,{seqData:seq,BPM:bpm,timeSignature:[num,den],activeRange:[1,used],activeDetailRange:[1,used],loopRange:[1,1]});
+  return{data:await writeKtk(song),warnings,info:{bpm,num,den,measures:used,tracks:parts.length,notes:count}};
+}
+window.ktkConvert=convert;   // 他のスクリプトからも利用可: await ktkConvert(uint8, {setProgram:true})
+
+/* ---------- UI ---------- */
+const $=id=>document.getElementById(id),log=$('ktk-log'),drop=$('ktk-drop');
+const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+async function handle(files){
+  const mids=[...files].filter(f=>/\.(mid|midi)$/i.test(f.name));
+  if(!mids.length){log.innerHTML='<li class="err">MIDI ファイル(.mid / .midi)を選んでください</li>';return}
+  log.innerHTML='';
+  let tpl=null;const tf=$('ktk-tpl').files[0];
+  if(tf)tpl=new Uint8Array(await tf.arrayBuffer());
+  for(const f of mids){
+    const li=document.createElement('li');log.appendChild(li);
+    try{
+      const r=await convert(new Uint8Array(await f.arrayBuffer()),{templateKtk:tpl,setProgram:$('ktk-prog').checked,includeDrums:$('ktk-drum').checked});
+      const name=f.name.replace(/\.[^.]+$/,'')+'.ktk',url=URL.createObjectURL(new Blob([r.data],{type:'application/octet-stream'})),i=r.info;
+      li.innerHTML=`<b>${esc(name)}</b>BPM ${i.bpm} / ${i.num}/${i.den}拍子 / ${i.measures}小節 / ${i.tracks}トラック / ${i.notes}音<br>`+
+        r.warnings.map(w=>`<span class="warn">⚠ ${esc(w)}</span><br>`).join('')+`<a href="${url}" download="${esc(name)}">ダウンロード</a>`;
+      li.querySelector('a').click();
+    }catch(e){li.className='err';li.innerHTML=`<b>${esc(f.name)}</b>変換できませんでした: ${esc(String(e.message||e))}`}
+  }
+}
+$('ktk-file').addEventListener('change',e=>{handle(e.target.files);e.target.value=''});
+['dragenter','dragover'].forEach(n=>drop.addEventListener(n,e=>{e.preventDefault();drop.classList.add('over')}));
+['dragleave','drop'].forEach(n=>drop.addEventListener(n,e=>{e.preventDefault();drop.classList.remove('over')}));
+drop.addEventListener('drop',e=>handle(e.dataTransfer.files));
+})();
+</script>
+</div>
+<!-- ===== ここまで ===== -->
+
+</body>
+</html>
